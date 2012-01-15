@@ -6,24 +6,28 @@ namespace Knockout
 	using System.Collections.Generic;
 	using System.Linq;
 	using System.Reflection;
-	
-	public class KoCreator : IKoCreator
+	using System.Web.Script.Serialization;
+
+    public class KoCreator : IKoCreator
 	{
 
 		private string _bindingTarget;
 		private IList<Subscription> _subscriptions = new List<Subscription>();
 		private IList<JsSubscription> _jsSubscriptions = new List<JsSubscription>();        
 		private IList<ViewModelToAdd> _viewModelsToAdd = new List<ViewModelToAdd>();
+        private IList<JsFunction> _jsFunctions = new List<JsFunction>();
+	    private ViewModel _initialValues;
+        
 
 		public string PageName { get; set; }
 	 
 
 		public string GenerateJs(object callingObject)
-		{
-			return _viewModelsToAdd.Aggregate("", (current, curVM) => current + createJSForVM(curVM.ObjType, curVM.VmName, callingObject.GetType()));
+		{            
+			return _viewModelsToAdd.Aggregate("", (current, curVM) => current + createJSForVM(curVM.ObjType, curVM.VmName, callingObject.GetType(), curVM.TargetBinding));
 		}
 
-		private string createJSForVM(Type curType, string vmName, Type callingObject)
+        private string createJSForVM(Type curType, string vmName, Type callingObject, string targetBinding)
 		{
 
 			string returnJs = "";
@@ -32,21 +36,66 @@ namespace Knockout
 
 			returnJs += CreateJSViewModel(curType);
 
+            returnJs += GetJSFunctions();
+            
+            returnJs += "}\n";
+
 			returnJs += "$(function() {var  " + vmName + " = ko.mapping.fromJS(baseModel);\n";
-		  
+
+          
 			returnJs = GetMethodJavascript(returnJs, callingObject, vmName);
 
 			returnJs += "window." + vmName + " = " + vmName + ";\n";
 
-			returnJs += GetBindingJavascript(vmName);
+			returnJs += GetBindingJavascript(vmName, targetBinding);
 
 			returnJs += GetDependabaleJavascript(vmName);
+            returnJs += GetPopulateInitialValuesJs(vmName);
+           
 
 			returnJs += "});\n";
 			returnJs += "});\n";
 
 			return returnJs;
 		}
+
+        private string GetPopulateInitialValuesJs(string curType)
+	    {
+	        var returnJs="";
+
+            var serializer = new JavaScriptSerializer();
+            
+            returnJs += "$(document).ready(function() {\n";
+            returnJs += "\n\tko.mapping.updateFromJS(" + curType + "," +  serializer.Serialize(_initialValues) + ")\n";
+            returnJs += RunOnLoadJs();
+            returnJs += "});";
+
+	        return returnJs;
+	    }
+
+        private string RunOnLoadJs()
+        {
+            var returnJs = _viewModelsToAdd.Where(viewModel => viewModel.JsFunctionName.Length >= 1).Aggregate("", (current, viewModel) => current + (viewModel.JsFunctionName + "();\n"));            
+
+            return returnJs ;
+        }
+
+	    private string GetJSFunctions()
+        {
+            string returnJs = "";
+
+            foreach (var curJsFunction in _jsFunctions)
+            {
+                returnJs += ",";
+                returnJs += curJsFunction.JsFunctionName + ":";
+                returnJs += "\tfunction(){";                
+                 returnJs += "\t\t" + curJsFunction.JsFunctionName + "();";                
+                returnJs += "\t}";
+            }
+
+            return returnJs;
+
+        }
 
 		private string GetMethodJavascript(string returnJs, Type curType, string vmName)
 		{
@@ -58,9 +107,12 @@ namespace Knockout
 			{
 				if (methodInfo.GetCustomAttributes(typeof(KoMethodAttribute), false).Count() >= 1)
 				{             
-					var x = (KoMethodAttribute) methodInfo.GetCustomAttributes(typeof (KoMethodAttribute), false)[0];
-					AddSubscription(x.ObservableField(), methodInfo.Name);
-					returnJs += "\t" + vmName + "." + methodInfo.Name + " = function (";
+					var customAttribute = (KoMethodAttribute) methodInfo.GetCustomAttributes(typeof (KoMethodAttribute), false)[0];
+                    if (customAttribute.ViewModel() == vmName)
+                    {
+                        if (customAttribute.ObservableField() != "")
+                            AddSubscription(customAttribute.ObservableField(), methodInfo.Name, vmName);
+                        returnJs += "\t" + vmName + "." + methodInfo.Name + " = function (";
 
 					var firstRun = true;
 
@@ -79,19 +131,31 @@ namespace Knockout
 						returnJs += parameterInfo.Name;
 					}
 
-					returnJs += "){\n";
-					returnJs += GetJSONCall(methodInfo.Name, vmName);
-					returnJs += "\t}\n";
+                        returnJs += "){\n";
+                        returnJs += GetJSONCall(methodInfo.Name, vmName, customAttribute.JavascriptFunctionToRunAfterMapping());
+                        returnJs += "\t}\n";
+                    }
 				}
 			}
 			return returnJs;
 		}
 
 
-		private string GetJSONCall(string methodName, string curType)
+		private string GetJSONCall(string methodName, string curType, string javascriptToRunAfterBinding)
 		{
-			return "\tjQuery.ajax({url: '/" + PageName + "/" + methodName +
-				   "',dataType:'json',contentType: 'application/json', type: \"post\", data: ko.toJSON(" + curType + "), success:function(" + methodName + "Result) {ko.mapping.updateFromJS(" + curType + ", " + methodName + "Result);\n}});";
+
+		    var returnJS = "\n\t\tjQuery.post('/" + PageName + "/" + methodName +
+		                   ".Rails','incomObject='+ ko.toJSON(" + curType + ")  ,function(" + methodName + "Result) {\n " +
+		                   " \t\t ko.mapping.updateFromJS(" + curType + ", " + methodName +
+		                   "Result);\n";
+
+
+            if (javascriptToRunAfterBinding.Length >= 1)
+            {
+                returnJS += "\t\t" + javascriptToRunAfterBinding + "();\n";
+            }
+		    returnJS += "\t}\n,\"json\");"; 
+		    return returnJS;
 		}
 
 		private string CreateJSViewModel(Type curType)
@@ -112,11 +176,10 @@ namespace Knockout
 				}
 
 				returnJs += typeof(Array).IsAssignableFrom(fieldInfo.PropertyType)
-								? fieldInfo.Name + ": ko.observable([])"
+                                ? fieldInfo.Name + ": ko.observableArray([])"
 								: fieldInfo.Name + ": ko.observable()";
 			}
-
-			returnJs += "}\n";
+			
 
 			return returnJs;
 		}
@@ -127,52 +190,66 @@ namespace Knockout
 
 		}
 
-		public void AddSubscription(string targetPropertyName, string subFunctionName)
+	    public void AddSubscription(string targetPropertyName, string subFunctionName, string viewModel)
 		{
-			_subscriptions.Add(new Subscription(targetPropertyName, subFunctionName));
+            _subscriptions.Add(new Subscription(targetPropertyName, subFunctionName, viewModel));
 		}
 
-		private string GetBindingJavascript(string curType)
+        
+
+        private string GetBindingJavascript(string curType, string targetBinding)
 		{
-			if (_bindingTarget == null)
+            if (targetBinding == "")
 			{
 				return "ko.applyBindings(window." + curType + ");";
 			}
 			else
 			{
-				return "ko.applyBindings(window." + curType + ", jQuery(\"" + _bindingTarget + "\").get(0));";    
+                return "ko.applyBindings(window." + curType + ", $(\"" + targetBinding + "\").get(0));";    
 			}
 			
 		}
 
-		private string GetDependabaleJavascript(string curType)
+		private string GetDependabaleJavascript(string viewModelName)
 		{
 			string result;
 			result = "";
 			
 			if (_subscriptions != null)
 			{
-				result = _subscriptions.Aggregate("", (current, curSub) => current + (curType + "." + curSub.TargetProperty + ".subscribe(function(){window." + curType + "." + curSub.SubscriptionFunctionName + "()});\r\n"));
+                result = _subscriptions.Where(func => func.ViewModel == viewModelName).Aggregate("", (current, subscription) => current + (viewModelName + "." + subscription.TargetProperty + ".subscribe(function(newValue){window." + viewModelName + "." + subscription.SubscriptionFunctionName + "()});\r\n"));
 			}
 
 			if (_jsSubscriptions != null)
 			{
-				result += _jsSubscriptions.Aggregate("", (current, curSub) => current + (curType + "." + curSub.TargetProperty + ".subscribe(function(){" + curSub.JsFunctionName + "()});\r\n"));
+				result += _jsSubscriptions.Aggregate("", (current, curSub) => current + (viewModelName + "." + curSub.TargetProperty + ".subscribe(function(newValue){" + curSub.JsFunctionName + "()});\r\n"));
 			}
 
 
 			return result;
 		}
 
-		public void AddViewModel(string vmName, Type vmType)
+        public void AddViewModel(string vmName, Type vmType, string targetBinding = "", string jsFunctionName = "")
 		{
-			_viewModelsToAdd.Add(new ViewModelToAdd(vmName, vmType));
+            _viewModelsToAdd.Add(new ViewModelToAdd(vmName, vmType, targetBinding, jsFunctionName));
 		}
+
+
+        public void AddViewModel(string vmName, ViewModel viewModel, string targetBinding = "", string jsFunctionName = "")
+        {
+            _viewModelsToAdd.Add(new ViewModelToAdd(vmName, viewModel.GetType(), targetBinding, jsFunctionName));
+            _initialValues = viewModel;
+        }
 
 		public void AddJsSubscription(string targetPropertyName, string jsFunctionName)
 		{          
 			_jsSubscriptions.Add(new JsSubscription(targetPropertyName, jsFunctionName));
 		}
+
+        public void AddJsFunction(string propertyName, string jsFunctionName)
+        {
+            _jsFunctions.Add(new JsFunction(propertyName, jsFunctionName));
+        }
 
 
 		private struct JsSubscription
@@ -187,16 +264,31 @@ namespace Knockout
 				JsFunctionName = jsFunctionName;
 			}
 		}
+
+        private struct JsFunction
+        {
+            public readonly string PropertyName;
+            public readonly string JsFunctionName;
+
+
+            public JsFunction(string propertyName, string jsFunctionName)
+            {
+                PropertyName = propertyName;
+                JsFunctionName = jsFunctionName;
+            }
+        }
+
 		private struct Subscription
 		{
 			public readonly string TargetProperty;
 			public readonly string SubscriptionFunctionName;
+            public readonly string ViewModel;
 
-
-			public Subscription(string targetProperty, string subscriptionFunctionName)
+            public Subscription(string targetProperty, string subscriptionFunctionName, string viewModel)
 			{
 				TargetProperty = targetProperty;
 				SubscriptionFunctionName = subscriptionFunctionName;
+			    ViewModel = viewModel;
 			}
 		}
 
@@ -204,12 +296,18 @@ namespace Knockout
 		{
 			public readonly string VmName;
 			public readonly Type ObjType;
+		    public string TargetBinding;
+            public readonly string JsFunctionName;
 
-			public ViewModelToAdd(string vmName, Type obj)
+		    public ViewModelToAdd(string vmName, Type obj, string targetBinding = "", string jsFunctionName = "")
 			{
 				VmName = vmName;
 				ObjType = obj;
+			    TargetBinding = targetBinding;
+			    JsFunctionName = jsFunctionName;
 			}
+
+
 		}
 
 
